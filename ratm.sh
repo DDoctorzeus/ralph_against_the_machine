@@ -631,7 +631,10 @@ integrate_task() {
     local id="$1"
     local commit="$2"
 
-    if ! git -C "$INTEGRATION_WT" cherry-pick "$commit" >/dev/null 2>"$LOG_DIR/$id-cherry-pick.err"; then
+    # --allow-empty is required here: run_task_worker() commits with
+    # --allow-empty too, since some tasks (e.g. ones that only touch files
+    # outside the repo) legitimately produce no repo diff.
+    if ! git -C "$INTEGRATION_WT" cherry-pick --allow-empty "$commit" >/dev/null 2>"$LOG_DIR/$id-cherry-pick.err"; then
         if ! resolve_cherry_pick_conflict "$id" "$commit"; then
             git -C "$INTEGRATION_WT" cherry-pick --abort >/dev/null 2>&1 || true
             return 1
