@@ -345,7 +345,6 @@ cat > "$PLAN_SCHEMA" <<'JSON'
           },
           "dependencies": {
             "type": "array",
-            "uniqueItems": true,
             "items": { "type": "string", "pattern": "^T[0-9]{2}$" }
           }
         },
