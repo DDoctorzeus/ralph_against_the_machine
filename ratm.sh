@@ -27,6 +27,15 @@ set -Eeuo pipefail
 #   RALPH_AGENT_FAILOVER=1    Fail a task over to the other provider when its
 #                             assigned agent reports a usage/credit/rate limit.
 #                             Set to 0 to disable and fail the task instead.
+#   RALPH_SANDBOX_NETWORK=1   Allow network/local-socket access inside Codex's
+#                             workspace-write sandbox (needed for `dotnet test`
+#                             and similar tooling that binds a local socket).
+#                             Set to 0 to keep Codex's default network-denied
+#                             sandbox.
+#   RALPH_STALL_LIMIT=2       Stop a task early if this many consecutive
+#                             passes produce an identical code diff (the
+#                             agent repeating itself rather than progressing),
+#                             instead of burning the rest of RALPH_MAX_PASSES.
 #
 # Usage:
 #   ./ratm.sh "Implement ..."
@@ -42,6 +51,8 @@ AUTO_YES="${RALPH_AUTO_YES:-0}"
 # the target repo and REPO_ROOT isn't known until after preflight, below.
 RUN_ROOT="${RALPH_RUN_ROOT:-}"
 AGENT_FAILOVER="${RALPH_AGENT_FAILOVER:-1}"
+SANDBOX_NETWORK="${RALPH_SANDBOX_NETWORK:-1}"
+STALL_LIMIT="${RALPH_STALL_LIMIT:-2}"
 
 PROMPT_FILE=""
 USER_PROMPT=""
@@ -61,6 +72,8 @@ Environment:
   RALPH_AUTO_YES=0
   RALPH_RUN_ROOT=<repo>/.ralph
   RALPH_AGENT_FAILOVER=1
+  RALPH_SANDBOX_NETWORK=1
+  RALPH_STALL_LIMIT=2
 USAGE
 }
 
@@ -163,6 +176,8 @@ fi
 is_positive_int "$MAX_WORKERS" || die "RALPH_MAX_WORKERS must be a positive integer"
 is_positive_int "$MAX_PASSES" || die "RALPH_MAX_PASSES must be a positive integer"
 [[ "$AGENT_FAILOVER" == "0" || "$AGENT_FAILOVER" == "1" ]] || die "RALPH_AGENT_FAILOVER must be 0 or 1"
+[[ "$SANDBOX_NETWORK" == "0" || "$SANDBOX_NETWORK" == "1" ]] || die "RALPH_SANDBOX_NETWORK must be 0 or 1"
+is_positive_int "$STALL_LIMIT" || die "RALPH_STALL_LIMIT must be a positive integer"
 [[ "${BASH_VERSINFO[0]}" -ge 4 ]] || die "Bash 4+ is required"
 
 for cmd in git jq codex claude; do
@@ -268,6 +283,14 @@ codex_exec() {
 
     cmd+=(exec --sandbox "$sandbox")
 
+    # Codex's workspace-write sandbox denies local sockets by default, which
+    # breaks tooling that binds one even for same-machine use (e.g. VSTest's
+    # test-host protocol under `dotnet test`). Opt-in via RALPH_SANDBOX_NETWORK
+    # since it also grants outbound network access, not just loopback.
+    if [[ "$sandbox" == "workspace-write" && "$SANDBOX_NETWORK" == "1" ]]; then
+        cmd+=(-c sandbox_workspace_write.network_access=true)
+    fi
+
     if [[ "$CODEX_EXEC_HELP" == *"--ephemeral"* ]]; then
         cmd+=(--ephemeral)
     fi
@@ -316,6 +339,19 @@ is_credit_limit_error() {
     grep -qiE \
         'usage limit|rate.?limit|too many requests|quota exceeded|insufficient[ _]quota|insufficient credit|out of credits|credit limit|billing hard limit|exceeded your current quota|usage cap|upgrade your plan|\b429\b' \
         "$1" 2>/dev/null
+}
+
+# Fingerprint of a worktree's actual code changes since its base commit, used
+# by run_task_worker() to detect a stalled task (a worker repeating itself
+# pass after pass instead of making progress). `add -A -N` (intent-to-add) is
+# non-destructive: it lets untracked files show up in the diff without
+# staging their content, so newly-created files count too, not just edits to
+# already-tracked ones. The two Ralph control files are excluded since their
+# wording changes every pass regardless of whether any code changed.
+worktree_diff_fingerprint() {
+    local wt="$1"
+    git -C "$wt" add -A -N >/dev/null 2>&1 || true
+    git -C "$wt" diff HEAD -- . ':(exclude).ralph-task.md' ':(exclude).ralph-progress.md' 2>/dev/null | cksum
 }
 
 # Registered as an EXIT trap so worker/integration worktrees are always torn
@@ -547,6 +583,13 @@ WORKER
     local pass=1
     local pass_out
     local failed_over=0
+    # Tracks consecutive passes whose code diff is byte-identical to the
+    # previous pass, so a task that's stopped making progress (e.g. stuck on
+    # an environment limitation it can't work around) gives up before
+    # burning the rest of its pass budget on repeats of the same pass.
+    local prev_fingerprint=""
+    local stall_count=0
+    local fingerprint
     while ((pass <= MAX_PASSES)); do
         printf '\n===== PASS %d/%d (%s) =====\n' "$pass" "$MAX_PASSES" "$agent" >> "$task_log"
 
@@ -585,6 +628,20 @@ WORKER
         if grep -qx 'STATUS: DONE' "$progress"; then
             break
         fi
+
+        fingerprint="$(worktree_diff_fingerprint "$wt")"
+        if [[ -n "$fingerprint" && "$fingerprint" == "$prev_fingerprint" ]]; then
+            ((stall_count+=1))
+        else
+            stall_count=0
+        fi
+        prev_fingerprint="$fingerprint"
+
+        if ((stall_count >= STALL_LIMIT)); then
+            warn "$id stalled: $((stall_count+1)) consecutive passes produced no code changes; stopping early instead of exhausting $MAX_PASSES passes (see $task_log)"
+            return 2
+        fi
+
         ((pass+=1))
     done
 

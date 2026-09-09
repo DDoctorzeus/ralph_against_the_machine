@@ -310,6 +310,34 @@ RALPH_MAX_PASSES=4
 
 This limits the number of fresh-context passes a worker can use before the task is considered failed.
 
+### Sandbox network access
+
+```bash
+RALPH_SANDBOX_NETWORK=0 ./ratm.sh -f prompt.md
+```
+
+Default:
+
+```text
+RALPH_SANDBOX_NETWORK=1
+```
+
+Codex's `workspace-write` sandbox denies socket creation by default, including loopback sockets — which breaks tooling that binds a local socket even for same-machine use, such as `dotnet test`'s VSTest test-host protocol. With the default `RALPH_SANDBOX_NETWORK=1`, Codex worker/validation/conflict-resolution passes are run with `-c sandbox_workspace_write.network_access=true` so that tooling works. Set this to `0` to keep Codex's default network-denied sandbox (note this also blocks genuine outbound network access, not just loopback).
+
+### Stalled-task detection
+
+```bash
+RALPH_STALL_LIMIT=3 ./ratm.sh -f prompt.md
+```
+
+Default:
+
+```text
+RALPH_STALL_LIMIT=2
+```
+
+After each pass that doesn't report `STATUS: DONE`, Ralph Against the Machine fingerprints the worktree's actual code diff (ignoring `.ralph-task.md`/`.ralph-progress.md`, whose wording changes every pass regardless). If this fingerprint is identical across `RALPH_STALL_LIMIT` consecutive passes, the worker has stopped making progress — usually because it's stuck on something it can't code its way around, such as an environment limitation — and the task is failed immediately instead of burning the rest of `RALPH_MAX_PASSES` repeating the same pass.
+
 ### Agent failover on credit/usage limits
 
 ```bash
