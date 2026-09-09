@@ -32,11 +32,21 @@ Ralph Against the Machine expects the following commands to be available:
 - Bash 4+
 - `git`
 - `jq`
-- `realpath` (GNU coreutils)
 - `codex`
 - `claude`
 
 Both Codex and Claude Code should already be authenticated with their respective accounts/subscriptions.
+
+### macOS
+
+macOS ships Bash 3.2, which is too old (no associative arrays, no `mapfile`). Install a current Bash via Homebrew and run the script with it explicitly:
+
+```bash
+brew install bash
+$(brew --prefix)/bin/bash ./ratm.sh -f prompt.md
+```
+
+Everything else in the script sticks to POSIX/BSD-compatible shell and coreutils usage, so no other changes should be needed on macOS.
 
 Ralph Against the Machine also checks that the installed Codex CLI supports the structured output and sandbox features it relies on, and that Claude Code supports non-interactive print mode.
 

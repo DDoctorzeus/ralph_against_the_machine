@@ -78,6 +78,21 @@ is_positive_int() {
     [[ "$1" =~ ^[1-9][0-9]*$ ]]
 }
 
+# Portable stand-in for GNU `realpath -m` (canonicalize, allow missing
+# components), which isn't available on macOS/BSD. Only the parent directory
+# needs to already exist; the final path component itself may not.
+abspath() {
+    local path="$1" dir base
+    if [[ -d "$path" ]]; then
+        (cd "$path" && pwd)
+        return
+    fi
+    dir="$(dirname "$path")"
+    base="$(basename "$path")"
+    mkdir -p "$dir"
+    printf '%s/%s\n' "$(cd "$dir" && pwd)" "$base"
+}
+
 # When the run root lives inside the target repository (the default,
 # <repo>/.ralph), make sure it's excluded from version control so run
 # artefacts (logs, task/plan state, worktrees) never get accidentally
@@ -150,7 +165,7 @@ is_positive_int "$MAX_PASSES" || die "RALPH_MAX_PASSES must be a positive intege
 [[ "$AGENT_FAILOVER" == "0" || "$AGENT_FAILOVER" == "1" ]] || die "RALPH_AGENT_FAILOVER must be 0 or 1"
 [[ "${BASH_VERSINFO[0]}" -ge 4 ]] || die "Bash 4+ is required"
 
-for cmd in git jq realpath codex claude; do
+for cmd in git jq codex claude; do
     require_cmd "$cmd"
 done
 
@@ -162,7 +177,7 @@ cd "$REPO_ROOT"
 # Default run root lives inside the repo (so a run's logs/task state/
 # worktrees are easy to find) and is normalised to an absolute path so the
 # containment check in ensure_run_root_gitignored() works reliably.
-RUN_ROOT="$(realpath -m "${RUN_ROOT:-$REPO_ROOT/.ralph}")"
+RUN_ROOT="$(abspath "${RUN_ROOT:-$REPO_ROOT/.ralph}")"
 
 BASE_COMMIT="$(git rev-parse HEAD)"
 REPO_NAME="$(basename "$REPO_ROOT" | tr -cs 'A-Za-z0-9._-' '-')"
