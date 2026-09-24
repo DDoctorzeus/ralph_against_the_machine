@@ -354,6 +354,33 @@ When a worker pass fails and its output looks like a provider usage, rate or cre
 
 Each task can fail over at most once, so a task never bounces back and forth between providers. Set this to `0` to disable failover and fail the task immediately instead.
 
+The same check covers the Codex planning pass: if it looks like Codex hit a usage/credit/rate limit before ever producing a plan, Ralph Against the Machine asks Claude to plan instead, appending the plan JSON schema to the planning prompt as an instruction (Claude's CLI has no `--output-schema` equivalent) rather than failing the run outright.
+
+### Worker vs orchestrator model/effort
+
+```bash
+RALPH_WORKER_CODEX_MODEL=gpt-5-mini \
+RALPH_WORKER_CLAUDE_MODEL=claude-haiku-4-5-20251001 \
+./ratm.sh -f prompt.md
+```
+
+Default:
+
+```text
+RALPH_WORKER_CODEX_MODEL=                        (whatever the codex CLI has configured)
+RALPH_WORKER_CODEX_REASONING_EFFORT=low
+RALPH_WORKER_CLAUDE_MODEL=claude-haiku-4-5-20251001
+RALPH_WORKER_CLAUDE_EFFORT=low
+RALPH_ORCHESTRATOR_CODEX_MODEL=                  (whatever the codex CLI has configured)
+RALPH_ORCHESTRATOR_CODEX_REASONING_EFFORT=       (whatever the codex CLI has configured)
+RALPH_ORCHESTRATOR_CLAUDE_MODEL=                 (whatever claude has configured)
+RALPH_ORCHESTRATOR_CLAUDE_EFFORT=                (whatever claude has configured)
+```
+
+The Ralph-loop worker passes (the actual implementation loop for each task) are a repetitive, fresh-context execution loop rather than something that needs deep judgement, so they default to a cheap/fast tier. Orchestration passes — planning, final validation, cherry-pick conflict resolution and cross-reference review — default to empty, i.e. whatever each CLI is already configured to use, since those benefit from a stronger model.
+
+Both ends are overridable independently: turn workers down further, turn the orchestrator up, or both, without one implying the other. `RALPH_WORKER_CODEX_MODEL`/`RALPH_ORCHESTRATOR_CODEX_MODEL` map to Codex's `-m/--model`; the `*_REASONING_EFFORT`/`*_EFFORT` variants map to Codex's `model_reasoning_effort` config override and Claude's `--effort` flag respectively.
+
 ### Keep worktrees
 
 ```bash
@@ -398,12 +425,31 @@ Each invocation creates its own run directory beneath this location, so successi
 
 When the run root is the in-repo default (or otherwise resolves to somewhere inside the repository), Ralph Against the Machine automatically adds an ignore pattern for it to the repo's `.gitignore` the first time it runs, so run artefacts (logs, task state, worktrees) are never accidentally committed. This is a one-time, uncommitted change to `.gitignore` — commit it when convenient. Point `RALPH_RUN_ROOT` somewhere outside the repository (e.g. `$HOME/.local/state/...`) if you'd rather not touch `.gitignore` at all.
 
+### Resuming an interrupted run
+
+```bash
+RALPH_RESUME=.ralph/ralph-myrepo-20260101-120000-1234 ./ratm.sh
+./ratm.sh --resume .ralph/ralph-myrepo-20260101-120000-1234
+```
+
+If the script is killed, the terminal is closed, or the machine restarts partway through a run, point `RALPH_RESUME` (or `--resume`) at that run's directory (printed at the top of its output, and named `ralph-<repo>-<timestamp>-<pid>`) to continue it. No prompt is required — resuming re-plans nothing and skips the worker confirmation.
+
+On resume, Ralph Against the Machine:
+
+- Reuses the original task plan, base commit and integration branch rather than starting over.
+- Skips every task that was already integrated onto the integration branch.
+- Retries everything else from scratch — pending, still-running or failed tasks at the moment of interruption — including tasks that failed outright, so resuming also doubles as a retry mechanism once you've fixed whatever caused the failure.
+
+This is task-level resume only: a task interrupted mid-pass restarts at pass 1 of its Ralph loop rather than continuing that exact pass, since per-pass progress isn't persisted outside the worker's own worktree.
+
 ## Run artefacts
 
 A run directory contains the generated planning, logging and review state, including files such as:
 
 ```text
 tasks.json
+run-meta.json             # repo/branch/prompt metadata, enables --resume
+state.json                # per-task status/agent/commits, enables --resume
 validation.json
 assignments.tsv
 logs/

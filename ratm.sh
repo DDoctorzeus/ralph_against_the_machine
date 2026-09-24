@@ -26,7 +26,9 @@ set -Eeuo pipefail
 #                             .gitignore automatically.
 #   RALPH_AGENT_FAILOVER=1    Fail a task over to the other provider when its
 #                             assigned agent reports a usage/credit/rate limit.
-#                             Set to 0 to disable and fail the task instead.
+#                             Also covers the Codex planning pass, which fails
+#                             over to Claude on the same condition. Set to 0
+#                             to disable and fail immediately instead.
 #   RALPH_SANDBOX_NETWORK=1   Allow network/local-socket access inside Codex's
 #                             workspace-write sandbox (needed for `dotnet test`
 #                             and similar tooling that binds a local socket).
@@ -36,11 +38,35 @@ set -Eeuo pipefail
 #                             passes produce an identical code diff (the
 #                             agent repeating itself rather than progressing),
 #                             instead of burning the rest of RALPH_MAX_PASSES.
+#   RALPH_RESUME              Path to a previous run directory to continue.
+#                             Skips planning/confirmation, skips tasks already
+#                             integrated, and retries anything else (pending,
+#                             mid-flight or failed at the time of interruption)
+#                             from scratch. Task-level granularity only: a
+#                             task interrupted mid-pass restarts at pass 1
+#                             rather than resuming that exact pass.
+#   RALPH_WORKER_CODEX_MODEL          Model for Codex Ralph-loop worker passes.
+#   RALPH_WORKER_CODEX_REASONING_EFFORT=low
+#                                     Reasoning effort for Codex worker passes.
+#   RALPH_WORKER_CLAUDE_MODEL=claude-haiku-4-5-20251001
+#                                     Model for Claude Ralph-loop worker passes.
+#   RALPH_WORKER_CLAUDE_EFFORT=low    Effort level for Claude worker passes.
+#                             Workers default to a cheap/fast tier since they
+#                             run a repetitive fresh-context implementation
+#                             loop rather than anything needing deep judgement.
+#   RALPH_ORCHESTRATOR_CODEX_MODEL, RALPH_ORCHESTRATOR_CODEX_REASONING_EFFORT,
+#   RALPH_ORCHESTRATOR_CLAUDE_MODEL, RALPH_ORCHESTRATOR_CLAUDE_EFFORT
+#                             Same, but for planning/validation/conflict
+#                             resolution/cross-reference review. Empty by
+#                             default (whatever each CLI is already configured
+#                             to use) since these passes benefit from a
+#                             stronger tier than the workers.
 #
 # Usage:
 #   ./ratm.sh "Implement ..."
 #   ./ratm.sh -f prompt.md
 #   cat prompt.md | ./ratm.sh
+#   ./ratm.sh --resume .ralph/ralph-myrepo-20260101-120000-1234
 
 MAX_WORKERS="${RALPH_MAX_WORKERS:-2}"
 MAX_PASSES="${RALPH_MAX_PASSES:-4}"
@@ -53,6 +79,22 @@ RUN_ROOT="${RALPH_RUN_ROOT:-}"
 AGENT_FAILOVER="${RALPH_AGENT_FAILOVER:-1}"
 SANDBOX_NETWORK="${RALPH_SANDBOX_NETWORK:-1}"
 STALL_LIMIT="${RALPH_STALL_LIMIT:-2}"
+RESUME_RUN_DIR="${RALPH_RESUME:-}"
+
+# Ralph-loop worker passes default to a cheap/fast tier (a repetitive,
+# fresh-context implementation loop doesn't need deep judgement).
+# Orchestration passes (planning/validation/conflict-resolution/cross-
+# reference) default to empty, i.e. whatever each CLI is already configured
+# to use, since those benefit from the stronger tier. Both ends are
+# independently overridable.
+WORKER_CODEX_MODEL="${RALPH_WORKER_CODEX_MODEL:-}"
+WORKER_CODEX_REASONING_EFFORT="${RALPH_WORKER_CODEX_REASONING_EFFORT:-low}"
+WORKER_CLAUDE_MODEL="${RALPH_WORKER_CLAUDE_MODEL:-claude-haiku-4-5-20251001}"
+WORKER_CLAUDE_EFFORT="${RALPH_WORKER_CLAUDE_EFFORT:-low}"
+ORCH_CODEX_MODEL="${RALPH_ORCHESTRATOR_CODEX_MODEL:-}"
+ORCH_CODEX_REASONING_EFFORT="${RALPH_ORCHESTRATOR_CODEX_REASONING_EFFORT:-}"
+ORCH_CLAUDE_MODEL="${RALPH_ORCHESTRATOR_CLAUDE_MODEL:-}"
+ORCH_CLAUDE_EFFORT="${RALPH_ORCHESTRATOR_CLAUDE_EFFORT:-}"
 
 PROMPT_FILE=""
 USER_PROMPT=""
@@ -63,6 +105,7 @@ Usage:
   ratm.sh "implementation prompt"
   ratm.sh -f prompt.md
   cat prompt.md | ratm.sh
+  ratm.sh --resume <run_dir>
 
 Environment:
   RALPH_MAX_WORKERS=2
@@ -74,6 +117,15 @@ Environment:
   RALPH_AGENT_FAILOVER=1
   RALPH_SANDBOX_NETWORK=1
   RALPH_STALL_LIMIT=2
+  RALPH_RESUME=<run_dir>
+  RALPH_WORKER_CODEX_MODEL=
+  RALPH_WORKER_CODEX_REASONING_EFFORT=low
+  RALPH_WORKER_CLAUDE_MODEL=claude-haiku-4-5-20251001
+  RALPH_WORKER_CLAUDE_EFFORT=low
+  RALPH_ORCHESTRATOR_CODEX_MODEL=
+  RALPH_ORCHESTRATOR_CODEX_REASONING_EFFORT=
+  RALPH_ORCHESTRATOR_CLAUDE_MODEL=
+  RALPH_ORCHESTRATOR_CLAUDE_EFFORT=
 USAGE
 }
 
@@ -142,6 +194,11 @@ while (($#)); do
             PROMPT_FILE="$2"
             shift 2
             ;;
+        -r|--resume)
+            (($# >= 2)) || die "$1 requires a run directory"
+            RESUME_RUN_DIR="$2"
+            shift 2
+            ;;
         -h|--help)
             usage
             exit 0
@@ -164,14 +221,16 @@ done
 if [[ -n "$PROMPT_FILE" ]]; then
     [[ -r "$PROMPT_FILE" ]] || die "Cannot read prompt file: $PROMPT_FILE"
     USER_PROMPT="$(cat "$PROMPT_FILE")"
-elif [[ -z "$USER_PROMPT" && ! -t 0 ]]; then
+elif [[ -z "$USER_PROMPT" && -z "$RESUME_RUN_DIR" && ! -t 0 ]]; then
     USER_PROMPT="$(cat)"
 fi
 
-[[ -n "${USER_PROMPT//[[:space:]]/}" ]] || {
-    usage
-    die "No implementation prompt supplied"
-}
+if [[ -z "$RESUME_RUN_DIR" ]]; then
+    [[ -n "${USER_PROMPT//[[:space:]]/}" ]] || {
+        usage
+        die "No implementation prompt supplied"
+    }
+fi
 
 is_positive_int "$MAX_WORKERS" || die "RALPH_MAX_WORKERS must be a positive integer"
 is_positive_int "$MAX_PASSES" || die "RALPH_MAX_PASSES must be a positive integer"
@@ -189,15 +248,6 @@ done
 REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || die "Run this from inside a git repository"
 cd "$REPO_ROOT"
 
-# Default run root lives inside the repo (so a run's logs/task state/
-# worktrees are easy to find) and is normalised to an absolute path so the
-# containment check in ensure_run_root_gitignored() works reliably.
-RUN_ROOT="$(abspath "${RUN_ROOT:-$REPO_ROOT/.ralph}")"
-
-BASE_COMMIT="$(git rev-parse HEAD)"
-REPO_NAME="$(basename "$REPO_ROOT" | tr -cs 'A-Za-z0-9._-' '-')"
-RUN_ID="$(date +%Y%m%d-%H%M%S)-$$"
-
 # Cache --help output so both the feature checks below and codex_exec()'s
 # flag detection (further down) can grep it without re-invoking the CLIs.
 CODEX_HELP="$(codex --help 2>&1 || true)"
@@ -209,18 +259,52 @@ CLAUDE_HELP="$(claude --help 2>&1 || true)"
 [[ "$CODEX_EXEC_HELP" == *"--sandbox"* ]] || die "Codex CLI is too old: codex exec lacks --sandbox"
 [[ "$CLAUDE_HELP" == *"--print"* || "$CLAUDE_HELP" == *"-p"* ]] || die "Claude Code CLI lacks non-interactive print mode"
 
-# Checked before touching anything on disk (including .gitignore, below) so
-# this check reflects the repo's pristine state rather than our own bootstrap.
-if [[ "$ALLOW_DIRTY" != "1" ]] && [[ -n "$(git status --porcelain)" ]]; then
-    die "Repository is dirty. Commit/stash first or set RALPH_ALLOW_DIRTY=1 (workers always start from HEAD)."
+if [[ -n "$RESUME_RUN_DIR" ]]; then
+    # Resuming: reuse everything about the previous run (run dir, base
+    # commit, integration branch, original prompt) rather than deriving a
+    # fresh run directory/branch from the repo's current state.
+    RUN_DIR="$(abspath "$RESUME_RUN_DIR")"
+    [[ -d "$RUN_DIR" ]] || die "Resume target does not exist: $RUN_DIR"
+
+    RUN_META="$RUN_DIR/run-meta.json"
+    [[ -f "$RUN_META" ]] || die "Resume target has no run-meta.json: $RUN_DIR (only runs that reached worker execution can be resumed)"
+    [[ -f "$RUN_DIR/tasks.json" ]] || die "Resume target is missing tasks.json: $RUN_DIR"
+
+    META_REPO_ROOT="$(jq -r '.repo_root' "$RUN_META")"
+    [[ "$META_REPO_ROOT" == "$REPO_ROOT" ]] || die "Resume target belongs to a different repository: $META_REPO_ROOT"
+
+    BASE_COMMIT="$(jq -r '.base_commit' "$RUN_META")"
+    RUN_ID="$(jq -r '.run_id' "$RUN_META")"
+    USER_PROMPT="$(jq -r '.user_prompt' "$RUN_META")"
+    INTEGRATION_BRANCH="$(jq -r '.integration_branch' "$RUN_META")"
+
+    git rev-parse --verify -q "$INTEGRATION_BRANCH" >/dev/null 2>&1 \
+        || die "Integration branch $INTEGRATION_BRANCH no longer exists; cannot resume"
+else
+    # Default run root lives inside the repo (so a run's logs/task state/
+    # worktrees are easy to find) and is normalised to an absolute path so the
+    # containment check in ensure_run_root_gitignored() works reliably.
+    RUN_ROOT="$(abspath "${RUN_ROOT:-$REPO_ROOT/.ralph}")"
+
+    BASE_COMMIT="$(git rev-parse HEAD)"
+    REPO_NAME="$(basename "$REPO_ROOT" | tr -cs 'A-Za-z0-9._-' '-')"
+    RUN_ID="$(date +%Y%m%d-%H%M%S)-$$"
+
+    # Checked before touching anything on disk (including .gitignore, below) so
+    # this check reflects the repo's pristine state rather than our own bootstrap.
+    if [[ "$ALLOW_DIRTY" != "1" ]] && [[ -n "$(git status --porcelain)" ]]; then
+        die "Repository is dirty. Commit/stash first or set RALPH_ALLOW_DIRTY=1 (workers always start from HEAD)."
+    fi
+
+    # Only touches .gitignore when the run root is the in-repo default; a custom
+    # RALPH_RUN_ROOT outside the repo is left alone. Safe to call on every run:
+    # it's a no-op once the ignore pattern is already present.
+    ensure_run_root_gitignored "$RUN_ROOT" "$REPO_ROOT"
+
+    RUN_DIR="$RUN_ROOT/ralph-${REPO_NAME}-${RUN_ID}"
+    INTEGRATION_BRANCH="ralph/$RUN_ID"
 fi
 
-# Only touches .gitignore when the run root is the in-repo default; a custom
-# RALPH_RUN_ROOT outside the repo is left alone. Safe to call on every run:
-# it's a no-op once the ignore pattern is already present.
-ensure_run_root_gitignored "$RUN_ROOT" "$REPO_ROOT"
-
-RUN_DIR="$RUN_ROOT/ralph-${REPO_NAME}-${RUN_ID}"
 WORKTREE_DIR="$RUN_DIR/worktrees"
 LOG_DIR="$RUN_DIR/logs"
 TASK_DIR="$RUN_DIR/tasks"
@@ -234,9 +318,9 @@ VALIDATION_SCHEMA="$RUN_DIR/validation.schema.json"
 VALIDATION_JSON="$RUN_DIR/validation.json"
 VALIDATION_PROMPT="$RUN_DIR/validation.prompt.md"
 ASSIGNMENTS="$RUN_DIR/assignments.tsv"
-: > "$ASSIGNMENTS"
+[[ -f "$ASSIGNMENTS" ]] || : > "$ASSIGNMENTS"
 
-INTEGRATION_BRANCH="ralph/$RUN_ID"
+RUN_META="${RUN_META:-$RUN_DIR/run-meta.json}"
 INTEGRATION_WT="$WORKTREE_DIR/integration"
 
 log "Preflight"
@@ -273,6 +357,8 @@ codex_exec() {
     local prompt_file="$3"
     local output_file="$4"
     local schema_file="${5:-}"
+    local model="${6:-}"
+    local reasoning_effort="${7:-}"
     local -a cmd=(codex)
 
     # Current Codex puts --ask-for-approval at the top level rather than after
@@ -290,6 +376,13 @@ codex_exec() {
     if [[ "$sandbox" == "workspace-write" && "$SANDBOX_NETWORK" == "1" ]]; then
         cmd+=(-c sandbox_workspace_write.network_access=true)
     fi
+
+    [[ -n "$model" ]] && cmd+=(-m "$model")
+    # Not a dedicated CLI flag; model_reasoning_effort is a config override
+    # like sandbox_workspace_write.network_access above. An unquoted word
+    # like "low" isn't valid TOML, so it falls back to Codex's documented
+    # literal-string behaviour rather than needing to be quoted here.
+    [[ -n "$reasoning_effort" ]] && cmd+=(-c "model_reasoning_effort=$reasoning_effort")
 
     if [[ "$CODEX_EXEC_HELP" == *"--ephemeral"* ]]; then
         cmd+=(--ephemeral)
@@ -320,6 +413,12 @@ claude_worker_exec() {
     local cwd="$1"
     local prompt_file="$2"
     local log_file="$3"
+    local model="${4:-}"
+    local effort="${5:-}"
+    local -a extra_flags=()
+
+    [[ -n "$model" ]] && extra_flags+=(--model "$model")
+    [[ -n "$effort" ]] && extra_flags+=(--effort "$effort")
 
     # Explicit tool allow-list keeps print mode non-interactive without using
     # --dangerously-skip-permissions.
@@ -328,7 +427,8 @@ claude_worker_exec() {
         claude -p "$(cat "$prompt_file")" \
             --output-format json \
             --permission-mode acceptEdits \
-            --allowedTools Read Write Edit Glob Grep Bash
+            --allowedTools Read Write Edit Glob Grep Bash \
+            "${extra_flags[@]}"
     ) > "$log_file" 2>&1
 }
 
@@ -339,6 +439,45 @@ is_credit_limit_error() {
     grep -qiE \
         'usage limit|rate.?limit|too many requests|quota exceeded|insufficient[ _]quota|insufficient credit|out of credits|credit limit|billing hard limit|exceeded your current quota|usage cap|upgrade your plan|\b429\b' \
         "$1" 2>/dev/null
+}
+
+# Fallback planner used when Codex's planning pass hits a usage/credit limit
+# (see RALPH_AGENT_FAILOVER). Claude's CLI has no --output-schema equivalent,
+# so the schema is appended to the prompt as an instruction instead and the
+# response is trusted to be JSON; a stray markdown code fence (models add
+# these despite being told not to) is stripped before validating it parses.
+plan_with_claude() {
+    local prompt_file="$1"
+    local schema_file="$2"
+    local output_file="$3"
+    local log_file="$4"
+    local claude_prompt="$RUN_DIR/plan.claude-prompt.md"
+    local claude_json="$RUN_DIR/plan.claude-raw.json"
+    local -a claude_orch_flags=()
+
+    [[ -n "$ORCH_CLAUDE_MODEL" ]] && claude_orch_flags+=(--model "$ORCH_CLAUDE_MODEL")
+    [[ -n "$ORCH_CLAUDE_EFFORT" ]] && claude_orch_flags+=(--effort "$ORCH_CLAUDE_EFFORT")
+
+    {
+        cat "$prompt_file"
+        printf '\n\nReturn ONLY a single JSON object matching this JSON schema exactly. No markdown code fences, no commentary, no surrounding text -- the response must be valid JSON on its own.\n\n'
+        cat "$schema_file"
+    } > "$claude_prompt"
+
+    if ! (
+        cd "$REPO_ROOT"
+        claude -p "$(cat "$claude_prompt")" \
+            --output-format json \
+            --permission-mode plan \
+            "${claude_orch_flags[@]}"
+    ) > "$claude_json" 2>&1; then
+        cp "$claude_json" "$log_file"
+        return 1
+    fi
+    cp "$claude_json" "$log_file"
+
+    jq -r '.result' "$claude_json" 2>/dev/null | sed -e '/^```/d' > "$output_file"
+    jq -e . "$output_file" >/dev/null 2>&1
 }
 
 # Fingerprint of a worktree's actual code changes since its base commit, used
@@ -368,10 +507,11 @@ cleanup_worktrees() {
 }
 trap cleanup_worktrees EXIT
 
-# JSON schema forced onto Codex's planning pass output: a project summary plus
-# a dependency-aware list of implementation tasks (id, title, description,
-# acceptance criteria, dependency task IDs).
-cat > "$PLAN_SCHEMA" <<'JSON'
+if [[ -z "$RESUME_RUN_DIR" ]]; then
+    # JSON schema forced onto Codex's planning pass output: a project summary plus
+    # a dependency-aware list of implementation tasks (id, title, description,
+    # acceptance criteria, dependency task IDs).
+    cat > "$PLAN_SCHEMA" <<'JSON'
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "type": "object",
@@ -407,7 +547,7 @@ cat > "$PLAN_SCHEMA" <<'JSON'
 }
 JSON
 
-cat > "$PLAN_PROMPT" <<EOF
+    cat > "$PLAN_PROMPT" <<EOF
 You are the planning/orchestration pass for an autonomous implementation run.
 
 Repository: $REPO_ROOT
@@ -435,55 +575,89 @@ Planning rules:
 10. Include test changes in the task that owns the behaviour where practical rather than creating a separate test-only task.
 EOF
 
-# Ask Codex (read-only sandbox: it must not modify the repo while planning)
-# to inspect the repository and turn the user prompt into structured tasks.
-log "Generating implementation tasks with Codex"
-if ! codex_exec read-only "$REPO_ROOT" "$PLAN_PROMPT" "$PLAN_JSON" "$PLAN_SCHEMA" \
-    >"$LOG_DIR/planner.log" 2>&1; then
-    cat "$LOG_DIR/planner.log" >&2
-    die "Codex planning pass failed"
+    # Ask Codex (read-only sandbox: it must not modify the repo while planning)
+    # to inspect the repository and turn the user prompt into structured tasks.
+    log "Generating implementation tasks with Codex"
+    PLANNER_AGENT="codex"
+    if ! codex_exec read-only "$REPO_ROOT" "$PLAN_PROMPT" "$PLAN_JSON" "$PLAN_SCHEMA" \
+        "$ORCH_CODEX_MODEL" "$ORCH_CODEX_REASONING_EFFORT" \
+        >"$LOG_DIR/planner.log" 2>&1; then
+        if [[ "$AGENT_FAILOVER" == "1" ]] && is_credit_limit_error "$LOG_DIR/planner.log"; then
+            warn "Codex planning pass appears to have hit a usage/credit limit; failing over to Claude for planning"
+            PLANNER_AGENT="claude"
+            if ! plan_with_claude "$PLAN_PROMPT" "$PLAN_SCHEMA" "$PLAN_JSON" "$LOG_DIR/planner.log"; then
+                cat "$LOG_DIR/planner.log" >&2
+                die "Codex planning pass hit a usage/credit limit and the Claude planning fallback also failed"
+            fi
+        else
+            cat "$LOG_DIR/planner.log" >&2
+            die "Codex planning pass failed"
+        fi
+    fi
+    ok "Plan generated by $PLANNER_AGENT"
+
+    # Sanity-check the planner's output before trusting it to drive scheduling:
+    # well-formed JSON, at least one task, no duplicate/unknown/self-referential
+    # dependency IDs.
+    jq -e '.project_summary | type == "string"' "$PLAN_JSON" >/dev/null || die "Planner returned invalid JSON"
+    jq -e '.tasks | type == "array" and length > 0' "$PLAN_JSON" >/dev/null || die "Planner returned no tasks"
+
+    DUP_IDS="$(jq -r '[.tasks[].id] | group_by(.)[] | select(length > 1) | .[0]' "$PLAN_JSON")"
+    [[ -z "$DUP_IDS" ]] || die "Planner returned duplicate task IDs: $DUP_IDS"
+
+    UNKNOWN_DEPS="$(jq -r '
+      [.tasks[].id] as $ids |
+      [.tasks[] | .id as $id | .dependencies[]? | select((. as $d | $ids | index($d)) == null) | "\($id)->\(.)"] |
+      .[]?
+    ' "$PLAN_JSON")"
+    [[ -z "$UNKNOWN_DEPS" ]] || die "Planner returned unknown dependencies: $UNKNOWN_DEPS"
+
+    SELF_DEPS="$(jq -r '.tasks[] | .id as $id | .dependencies[]? | select(. == $id) | $id' "$PLAN_JSON")"
+    [[ -z "$SELF_DEPS" ]] || die "Planner returned self-dependent tasks: $SELF_DEPS"
+
+    printf '\n\033[1mImplementation plan\033[0m\n'
+    printf '%s\n\n' "$(jq -r '.project_summary' "$PLAN_JSON")"
+    jq -r '
+      .tasks[] |
+      "\(.id)  \(.title)" +
+      "\n    Depends: " + (if (.dependencies | length) == 0 then "none" else (.dependencies | join(", ")) end) +
+      "\n    \(.description)" +
+      "\n" + (.acceptance_criteria | map("      - " + .) | join("\n")) + "\n"
+    ' "$PLAN_JSON"
+
+    if [[ "$AUTO_YES" != "1" ]]; then
+        read -r -p "Spawn Codex/Claude workers for this plan? [Y/n] " answer
+        case "${answer:-y}" in
+            y|Y|yes|YES) ;;
+            *) die "Cancelled before worker execution. Plan retained at $PLAN_JSON" ;;
+        esac
+    fi
+
+    git branch "$INTEGRATION_BRANCH" "$BASE_COMMIT"
+    git worktree add -q "$INTEGRATION_WT" "$INTEGRATION_BRANCH"
+    ok "Integration branch: $INTEGRATION_BRANCH"
+
+    # Written now (rather than at RUN_DIR creation) since a run only becomes
+    # resumable once the integration branch exists to resume onto.
+    jq -n \
+        --arg repo_root "$REPO_ROOT" \
+        --arg base_commit "$BASE_COMMIT" \
+        --arg run_id "$RUN_ID" \
+        --arg integration_branch "$INTEGRATION_BRANCH" \
+        --arg user_prompt "$USER_PROMPT" \
+        '{repo_root: $repo_root, base_commit: $base_commit, run_id: $run_id, integration_branch: $integration_branch, user_prompt: $user_prompt}' \
+        > "$RUN_META"
+else
+    # Resuming: the integration branch already carries every previously
+    # integrated task's commits, so just re-attach a fresh worktree to its
+    # current tip rather than recreating the branch.
+    log "Resuming run $RUN_ID from $RUN_DIR"
+    ok "Integration branch: $INTEGRATION_BRANCH"
+    git worktree prune >/dev/null 2>&1 || true
+    git worktree remove --force "$INTEGRATION_WT" >/dev/null 2>&1 || true
+    rm -rf "$INTEGRATION_WT"
+    git worktree add -q "$INTEGRATION_WT" "$INTEGRATION_BRANCH"
 fi
-
-# Sanity-check the planner's output before trusting it to drive scheduling:
-# well-formed JSON, at least one task, no duplicate/unknown/self-referential
-# dependency IDs.
-jq -e '.project_summary | type == "string"' "$PLAN_JSON" >/dev/null || die "Planner returned invalid JSON"
-jq -e '.tasks | type == "array" and length > 0' "$PLAN_JSON" >/dev/null || die "Planner returned no tasks"
-
-DUP_IDS="$(jq -r '[.tasks[].id] | group_by(.)[] | select(length > 1) | .[0]' "$PLAN_JSON")"
-[[ -z "$DUP_IDS" ]] || die "Planner returned duplicate task IDs: $DUP_IDS"
-
-UNKNOWN_DEPS="$(jq -r '
-  [.tasks[].id] as $ids |
-  [.tasks[] | .id as $id | .dependencies[]? | select((. as $d | $ids | index($d)) == null) | "\($id)->\(.)"] |
-  .[]?
-' "$PLAN_JSON")"
-[[ -z "$UNKNOWN_DEPS" ]] || die "Planner returned unknown dependencies: $UNKNOWN_DEPS"
-
-SELF_DEPS="$(jq -r '.tasks[] | .id as $id | .dependencies[]? | select(. == $id) | $id' "$PLAN_JSON")"
-[[ -z "$SELF_DEPS" ]] || die "Planner returned self-dependent tasks: $SELF_DEPS"
-
-printf '\n\033[1mImplementation plan\033[0m\n'
-printf '%s\n\n' "$(jq -r '.project_summary' "$PLAN_JSON")"
-jq -r '
-  .tasks[] |
-  "\(.id)  \(.title)" +
-  "\n    Depends: " + (if (.dependencies | length) == 0 then "none" else (.dependencies | join(", ")) end) +
-  "\n    \(.description)" +
-  "\n" + (.acceptance_criteria | map("      - " + .) | join("\n")) + "\n"
-' "$PLAN_JSON"
-
-if [[ "$AUTO_YES" != "1" ]]; then
-    read -r -p "Spawn Codex/Claude workers for this plan? [Y/n] " answer
-    case "${answer:-y}" in
-        y|Y|yes|YES) ;;
-        *) die "Cancelled before worker execution. Plan retained at $PLAN_JSON" ;;
-    esac
-fi
-
-git branch "$INTEGRATION_BRANCH" "$BASE_COMMIT"
-git worktree add -q "$INTEGRATION_WT" "$INTEGRATION_BRANCH"
-ok "Integration branch: $INTEGRATION_BRANCH"
 
 declare -A STATUS
 declare -A AGENT
@@ -498,6 +672,70 @@ for id in "${TASK_IDS[@]}"; do
 done
 
 AGENT_COUNTER=0
+
+# Persists STATUS/AGENT/commit state for every task to $RUN_DIR/state.json so
+# an interrupted run can be continued with RALPH_RESUME/--resume without
+# re-running already-integrated tasks. Task-level granularity only: a task
+# interrupted mid-flight is retried from scratch next time, not resumed
+# mid-pass.
+save_state() {
+    local id
+    {
+        for id in "${TASK_IDS[@]}"; do
+            jq -n \
+                --arg id "$id" \
+                --arg status "${STATUS[$id]:-pending}" \
+                --arg agent "${AGENT[$id]:-}" \
+                --arg worker_commit "${WORKER_COMMIT[$id]:-}" \
+                --arg integrated_commit "${INTEGRATED_COMMIT[$id]:-}" \
+                '{($id): {status: $status, agent: $agent, worker_commit: $worker_commit, integrated_commit: $integrated_commit}}'
+        done
+    } | jq -s 'add // {}' > "$RUN_DIR/state.json.tmp"
+    printf '%s\n' "$AGENT_COUNTER" > "$RUN_DIR/agent-counter.txt"
+    mv "$RUN_DIR/state.json.tmp" "$RUN_DIR/state.json"
+}
+
+# Restores STATUS/AGENT/commit state from a previous run's state.json. Only
+# tasks already "done" (integrated onto $INTEGRATION_BRANCH) are preserved;
+# every other status at the time of interruption (pending/running/implemented/
+# failed) is left at the "pending" default set above and retried from scratch.
+load_state() {
+    local state_file="$RUN_DIR/state.json"
+    [[ -f "$state_file" ]] || die "Resume target has no state.json: $RUN_DIR"
+
+    local id status agent worker_commit integrated_commit
+    while IFS=$'\t' read -r id status agent worker_commit integrated_commit; do
+        [[ -z "$id" || "$status" != "done" ]] && continue
+        STATUS["$id"]="done"
+        AGENT["$id"]="$agent"
+        WORKER_COMMIT["$id"]="$worker_commit"
+        INTEGRATED_COMMIT["$id"]="$integrated_commit"
+    done < <(jq -r 'to_entries[] | [.key, .value.status, .value.agent, .value.worker_commit, .value.integrated_commit] | @tsv' "$state_file")
+
+    [[ -f "$RUN_DIR/agent-counter.txt" ]] && AGENT_COUNTER="$(cat "$RUN_DIR/agent-counter.txt")"
+}
+
+if [[ -n "$RESUME_RUN_DIR" ]]; then
+    load_state
+
+    DONE_COUNT=0
+    for id in "${TASK_IDS[@]}"; do
+        [[ "${STATUS[$id]}" == "done" ]] && ((DONE_COUNT+=1))
+    done
+    log "Resumed state: $DONE_COUNT/${#TASK_IDS[@]} tasks already integrated"
+
+    # Anything not done may have left a worktree/branch behind from the
+    # interrupted attempt; clear it so this run can recreate it from scratch.
+    for id in "${TASK_IDS[@]}"; do
+        [[ "${STATUS[$id]}" == "done" ]] && continue
+        stale_safe_id="$(printf '%s' "$id" | tr -cs 'A-Za-z0-9._-' '-')"
+        git worktree remove --force "$WORKTREE_DIR/$stale_safe_id" >/dev/null 2>&1 || true
+        rm -rf "${WORKTREE_DIR:?}/$stale_safe_id"
+        git branch -D "${INTEGRATION_BRANCH}-${stale_safe_id}" >/dev/null 2>&1 || true
+    done
+fi
+
+save_state
 
 make_task_file() {
     local id="$1"
@@ -595,7 +833,8 @@ WORKER
 
         if [[ "$agent" == "codex" ]]; then
             pass_out="$LOG_DIR/$id-codex-pass-$pass.txt"
-            if ! codex_exec workspace-write "$wt" "$worker_prompt" "$pass_out" \
+            if ! codex_exec workspace-write "$wt" "$worker_prompt" "$pass_out" "" \
+                "$WORKER_CODEX_MODEL" "$WORKER_CODEX_REASONING_EFFORT" \
                 >>"$task_log" 2>&1; then
                 if [[ "$AGENT_FAILOVER" == "1" ]] && ((! failed_over)) && is_credit_limit_error "$task_log"; then
                     warn "$id Codex appears to have hit a usage/credit limit; failing over to Claude"
@@ -610,7 +849,8 @@ WORKER
             cat "$pass_out" >> "$task_log" 2>/dev/null || true
         else
             pass_out="$LOG_DIR/$id-claude-pass-$pass.json"
-            if ! claude_worker_exec "$wt" "$worker_prompt" "$pass_out"; then
+            if ! claude_worker_exec "$wt" "$worker_prompt" "$pass_out" \
+                "$WORKER_CLAUDE_MODEL" "$WORKER_CLAUDE_EFFORT"; then
                 cat "$pass_out" >> "$task_log" 2>/dev/null || true
                 if [[ "$AGENT_FAILOVER" == "1" ]] && ((! failed_over)) && is_credit_limit_error "$task_log"; then
                     warn "$id Claude appears to have hit a usage/credit limit; failing over to Codex"
@@ -681,7 +921,8 @@ Resolve files only and run focused checks where practical.
 EOF
 
     warn "$id cherry-pick conflicted; asking Codex to resolve the integration conflict"
-    if ! codex_exec workspace-write "$INTEGRATION_WT" "$prompt" "$out" \
+    if ! codex_exec workspace-write "$INTEGRATION_WT" "$prompt" "$out" "" \
+        "$ORCH_CODEX_MODEL" "$ORCH_CODEX_REASONING_EFFORT" \
         >>"$LOG_DIR/$id-conflict-resolution.log" 2>&1; then
         return 1
     fi
@@ -799,6 +1040,7 @@ while ! all_done; do
         run_task_worker "$id" "$agent" "$wt" "$branch" &
         ID_TO_PID["$id"]=$!
     done
+    save_state
 
     FAILED=0
     for id in "${BATCH[@]}"; do
@@ -822,9 +1064,10 @@ while ! all_done; do
             warn "$id ${AGENT[$id]} worker failed"
         fi
     done
+    save_state
 
     if ((FAILED)); then
-        die "One or more workers failed. Logs and worktrees are under $RUN_DIR"
+        die "One or more workers failed. Logs and worktrees are under $RUN_DIR. Fix the underlying issue, then RALPH_RESUME=$RUN_DIR to retry the failed/unfinished tasks without redoing what already integrated."
     fi
 
     # Serial integration is intentional: all tasks in this wave started from the
@@ -849,6 +1092,7 @@ while ! all_done; do
             git branch -D "${TASK_BRANCH[$id]}" >/dev/null 2>&1 || true
         fi
     done
+    save_state
 done
 
 # JSON schema forced onto Codex's final validation pass: a PASS/WARN/FAIL
@@ -912,6 +1156,7 @@ EOF
 # Codex can execute tests/builds (but is not meant to change the implementation).
 printf '\n\033[1mCodex validation\033[0m\n'
 if ! codex_exec workspace-write "$INTEGRATION_WT" "$VALIDATION_PROMPT" "$VALIDATION_JSON" "$VALIDATION_SCHEMA" \
+    "$ORCH_CODEX_MODEL" "$ORCH_CODEX_REASONING_EFFORT" \
     >"$LOG_DIR/validator.log" 2>&1; then
     cat "$LOG_DIR/validator.log" >&2
     die "Codex validation pass failed"
@@ -957,12 +1202,16 @@ cross_reference_task() {
 
     if [[ "$author" == "codex" ]]; then
         local json_out="$REVIEW_DIR/$id.claude.json"
+        local -a claude_orch_flags=()
+        [[ -n "$ORCH_CLAUDE_MODEL" ]] && claude_orch_flags+=(--model "$ORCH_CLAUDE_MODEL")
+        [[ -n "$ORCH_CLAUDE_EFFORT" ]] && claude_orch_flags+=(--effort "$ORCH_CLAUDE_EFFORT")
         if cat "$input_file" | (
             cd "$INTEGRATION_WT"
             claude -p \
                 "Act as an independent code reviewer. Review the supplied task and patch for correctness, regressions, missed acceptance criteria and test gaps. Be concise but specific. Do not modify files." \
                 --output-format json \
-                --permission-mode plan
+                --permission-mode plan \
+                "${claude_orch_flags[@]}"
         ) > "$json_out" 2>&1; then
             jq -r '.result // .' "$json_out" > "$review_file" 2>/dev/null || cp "$json_out" "$review_file"
         else
@@ -977,7 +1226,8 @@ Review integrated commit $commit against $task_json and the surrounding reposito
 Look for correctness problems, regressions, missed acceptance criteria, architectural problems and test gaps.
 Do not modify files. Give a concise, specific review and explicitly say when no material issue is found.
 EOF
-        codex_exec read-only "$INTEGRATION_WT" "$prompt" "$review_file" \
+        codex_exec read-only "$INTEGRATION_WT" "$prompt" "$review_file" "" \
+            "$ORCH_CODEX_MODEL" "$ORCH_CODEX_REASONING_EFFORT" \
             >"$REVIEW_DIR/$id.codex.log" 2>&1
     fi
 }
